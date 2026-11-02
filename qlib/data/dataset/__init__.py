@@ -12,6 +12,14 @@ from ...utils import lazy_sort_index
 from .utils import get_level_index
 
 
+def _ffill_axis1(arr: np.ndarray) -> np.ndarray:
+    """Forward fill NaNs along the last axis of a 2D array (vectorized ``np_ffill``)."""
+    mask = np.isnan(arr)
+    idx = np.where(~mask, np.arange(arr.shape[1]), 0)
+    np.maximum.accumulate(idx, axis=1, out=idx)
+    return np.take_along_axis(arr, idx, axis=1)
+
+
 class Dataset(Serializable):
     """
     Preparing data for model training and inferencing.
@@ -593,6 +601,39 @@ class TSDataSampler:
         else:
             raise NotImplementedError(f"This type of input is not supported")
         return i, j
+
+    def to_numpy(self) -> np.ndarray:
+        """Materialize the whole dataset as a contiguous ``[N, step_len, feature_dim]`` array.
+
+        Equivalent to ``self[np.arange(len(self))]`` but fully vectorized, so it
+        avoids the per-sample Python loop in ``__getitem__`` (which becomes the
+        bottleneck when uploaded to an accelerator during inference).
+        """
+        n = len(self.idx_map)
+        step_len = self.step_len
+        if n == 0:
+            return self.data_arr[:0].reshape(0, step_len, -1)
+
+        rows = self.idx_map[:, 0].astype(np.int64)
+        cols = self.idx_map[:, 1].astype(np.int64)
+
+        # For each sample, the ``step_len`` rows ending at ``rows`` (ascending in
+        # time); leading padding rows (``row_seq < 0``) are marked invalid.
+        offsets = np.arange(step_len) - (step_len - 1)
+        row_seq = rows[:, None] + offsets[None, :]  # [N, step_len]
+        valid = row_seq >= 0
+        row_seq = np.where(valid, row_seq, 0)
+
+        indices = self.idx_arr[row_seq, cols[:, None]].astype(np.float64)  # [N, step_len]
+        indices = np.where(valid, indices, np.nan)
+
+        if self.fillna_type == "ffill":
+            indices = _ffill_axis1(indices)
+        elif self.fillna_type == "ffill+bfill":
+            indices = _ffill_axis1(_ffill_axis1(indices)[:, ::-1])[:, ::-1]
+
+        indices = np.nan_to_num(indices, nan=self.nan_idx).astype(np.int64)
+        return self.data_arr[indices.reshape(-1)].reshape(n, step_len, -1)
 
     def __getitem__(self, idx: Union[int, Tuple[object, str], List[int]]):
         """
