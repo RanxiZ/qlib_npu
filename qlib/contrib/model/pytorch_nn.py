@@ -17,8 +17,9 @@ from sklearn.metrics import roc_auc_score, mean_squared_error
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
+from .infer_utils import InferTensorCache, to_infer_device
 from .pytorch_utils import count_parameters
+from .torch_device import empty_torch_cache, resolve_torch_device, use_torch_device
 from ...model.base import Model
 from ...data.dataset import DatasetH
 from ...data.dataset.handler import DataHandlerLP
@@ -75,6 +76,8 @@ class DNNModelPytorch(Model):
             "input_dim": 360,
             "layers": (256,),
         },
+        use_fp16=False,
+        pred_batch_size=16000,
         valid_key=DataHandlerLP.DK_L,
         # TODO: Infer Key is a more reasonable key. But it requires more detailed processing on label processing
     ):
@@ -90,15 +93,18 @@ class DNNModelPytorch(Model):
         self.eval_steps = eval_steps
         self.optimizer = optimizer.lower()
         self.loss_type = loss
-        if isinstance(GPU, str):
-            self.device = torch.device(GPU)
-        else:
-            self.device = torch.device("cuda:%d" % (GPU) if torch.cuda.is_available() and GPU >= 0 else "cpu")
+        self.device = resolve_torch_device(gpu=GPU)
+
         self.seed = seed
         self.weight_decay = weight_decay
         self.data_parall = data_parall
         self.eval_train_metric = eval_train_metric
         self.valid_key = valid_key
+        self.use_fp16 = use_fp16
+        self.pred_batch_size = pred_batch_size
+
+        # cache for the last uploaded inference features (data "常驻 NPU")
+        self._infer_cache = InferTensorCache()
 
         self.best_step = None
 
@@ -131,8 +137,8 @@ class DNNModelPytorch(Model):
         if init_model is None:
             self.dnn_model = init_instance_by_config({"class": pt_model_uri, "kwargs": pt_model_kwargs})
 
-            if self.data_parall:
-                self.dnn_model = DataParallel(self.dnn_model).to(self.device)
+            if self.data_parall and self.device.type == "cuda":
+                self.dnn_model = DataParallel(self.dnn_model)
         else:
             self.dnn_model = init_model
 
@@ -185,7 +191,7 @@ class DNNModelPytorch(Model):
 
     @property
     def use_gpu(self):
-        return self.device != torch.device("cpu")
+        return use_torch_device(self.device)
 
     def fit(
         self,
@@ -220,6 +226,16 @@ class DNNModelPytorch(Model):
                     all_t[v][seg] = torch.from_numpy(all_df[v][seg].values).float()
                     # if seg == "valid": # accelerate the eval of validation
                     all_t[v][seg] = all_t[v][seg].to(self.device)  # This will consume a lot of memory !!!!
+                    # ``DataFrame.values`` is Fortran-ordered, so the uploaded
+                    # tensor lands on the accelerator in a column-major
+                    # (feature-first, non-contiguous) layout.  Each per-step
+                    # fancy index ``x[choice]`` inside the training loop would
+                    # then force ``aclnnIndex`` to transpose the whole tensor
+                    # to row-major every single step.  Materialize the
+                    # row-major contiguous layout once here instead (a single
+                    # ~850us device transpose), so per-step indexing operates
+                    # directly on a contiguous tensor.
+                    all_t[v][seg] = all_t[v][seg].contiguous()
 
                 evals_result[seg] = []
                 # free memory
@@ -333,7 +349,7 @@ class DNNModelPytorch(Model):
             # restore the optimal parameters after training
             self.dnn_model.load_state_dict(torch.load(save_path, map_location=self.device))
         if self.use_gpu:
-            torch.cuda.empty_cache()
+            empty_torch_cache(self.device)
 
     def get_lr(self):
         assert len(self.train_optimizer.param_groups) == 1
@@ -361,18 +377,13 @@ class DNNModelPytorch(Model):
         1) test inference (data may come from CPU and expect the output data is on CPU)
         2) evaluation on training (data may come from GPU)
         """
-        if not isinstance(data, torch.Tensor):
-            if isinstance(data, pd.DataFrame):
-                data = data.values
-            data = torch.Tensor(data)
-        data = data.to(self.device)
+        data = to_infer_device(data, self.device, use_fp16=self.use_fp16, cache=self._infer_cache)
         preds = []
         self.dnn_model.eval()
         with torch.no_grad():
-            batch_size = 8096
-            for i in range(0, len(data), batch_size):
-                x = data[i : i + batch_size]
-                preds.append(self.dnn_model(x.to(self.device)).detach().reshape(-1))
+            for i in range(0, len(data), self.pred_batch_size):
+                x = data[i : i + self.pred_batch_size]
+                preds.append(self.dnn_model(x).detach().reshape(-1))
         if return_cpu:
             preds = np.concatenate([pr.cpu().numpy() for pr in preds])
         else:
