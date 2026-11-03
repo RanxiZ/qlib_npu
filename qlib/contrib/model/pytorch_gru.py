@@ -20,6 +20,9 @@ from ...log import get_module_logger
 from ...model.base import Model
 from ...utils import get_or_create_path
 from .pytorch_utils import count_parameters
+from .torch_device import empty_torch_cache, resolve_torch_device, use_torch_device
+from .npu_rnn import rnn_forward
+from .infer_utils import InferTensorCache, to_infer_device
 
 
 class GRU(Model):
@@ -52,6 +55,8 @@ class GRU(Model):
         optimizer="adam",
         GPU=0,
         seed=None,
+        use_fp16=False,
+        pred_batch_size=16000,
         **kwargs,
     ):
         # Set logger.
@@ -70,8 +75,13 @@ class GRU(Model):
         self.early_stop = early_stop
         self.optimizer = optimizer.lower()
         self.loss = loss
-        self.device = torch.device("cuda:%d" % (GPU) if torch.cuda.is_available() and GPU >= 0 else "cpu")
+        self.device = resolve_torch_device(gpu=GPU)
         self.seed = seed
+        self.use_fp16 = use_fp16
+        self.pred_batch_size = pred_batch_size
+
+        # cache for the last uploaded inference features (data "常驻 NPU")
+        self._infer_cache = InferTensorCache()
 
         self.logger.info(
             "GRU parameters setting:"
@@ -131,7 +141,7 @@ class GRU(Model):
 
     @property
     def use_gpu(self):
-        return self.device != torch.device("cpu")
+        return use_torch_device(self.device)
 
     def mse(self, pred, label):
         loss = (pred - label) ** 2
@@ -287,7 +297,7 @@ class GRU(Model):
                 rec.log_metrics(step=i, **{k: v})
 
         if self.use_gpu:
-            torch.cuda.empty_cache()
+            empty_torch_cache(self.device)
 
     def predict(self, dataset: DatasetH, segment: Union[Text, slice] = "test"):
         if not self.fitted:
@@ -296,24 +306,19 @@ class GRU(Model):
         x_test = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_I)
         index = x_test.index
         self.gru_model.eval()
-        x_values = x_test.values
-        sample_num = x_values.shape[0]
+
+        # Upload features once to the accelerator (F-order handled inside) and
+        # batch over the resident device tensor, mirroring the MLP predict path.
+        data = to_infer_device(x_test, self.device, use_fp16=self.use_fp16, cache=self._infer_cache)
+
         preds = []
+        with torch.no_grad():
+            for begin in range(0, len(data), self.pred_batch_size):
+                x = data[begin : begin + self.pred_batch_size]
+                preds.append(self.gru_model(x).detach())
+        preds = torch.cat(preds).cpu().numpy()
 
-        for begin in range(sample_num)[:: self.batch_size]:
-            if sample_num - begin < self.batch_size:
-                end = sample_num
-            else:
-                end = begin + self.batch_size
-
-            x_batch = torch.from_numpy(x_values[begin:end]).float().to(self.device)
-
-            with torch.no_grad():
-                pred = self.gru_model(x_batch).detach().cpu().numpy()
-
-            preds.append(pred)
-
-        return pd.Series(np.concatenate(preds), index=index)
+        return pd.Series(preds.reshape(-1), index=index)
 
 
 class GRUModel(nn.Module):
@@ -335,5 +340,5 @@ class GRUModel(nn.Module):
         # x: [N, F*T]
         x = x.reshape(len(x), self.d_feat, -1)  # [N, F, T]
         x = x.permute(0, 2, 1)  # [N, T, F]
-        out, _ = self.rnn(x)
+        out = rnn_forward(self.rnn, x)
         return self.fc_out(out[:, -1, :]).squeeze()

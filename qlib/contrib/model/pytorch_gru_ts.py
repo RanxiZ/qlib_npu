@@ -17,6 +17,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from .pytorch_utils import count_parameters
+from .torch_device import empty_torch_cache, resolve_torch_device, use_torch_device
+from .npu_rnn import rnn_forward
+from .infer_utils import InferTensorCache, to_infer_device
 from ...model.base import Model
 from ...data.dataset.handler import DataHandlerLP
 from ...model.utils import ConcatDataset
@@ -54,6 +57,8 @@ class GRU(Model):
         n_jobs=10,
         GPU=0,
         seed=None,
+        use_fp16=False,
+        pred_batch_size=16000,
         **kwargs,
     ):
         # Set logger.
@@ -72,9 +77,14 @@ class GRU(Model):
         self.early_stop = early_stop
         self.optimizer = optimizer.lower()
         self.loss = loss
-        self.device = torch.device("cuda:%d" % (GPU) if torch.cuda.is_available() and GPU >= 0 else "cpu")
+        self.device = resolve_torch_device(gpu=GPU)
         self.n_jobs = n_jobs
         self.seed = seed
+        self.use_fp16 = use_fp16
+        self.pred_batch_size = pred_batch_size
+
+        # cache for the last uploaded inference features (data "常驻 NPU")
+        self._infer_cache = InferTensorCache()
 
         self.logger.info(
             "GRU parameters setting:"
@@ -136,7 +146,7 @@ class GRU(Model):
 
     @property
     def use_gpu(self):
-        return self.device != torch.device("cpu")
+        return use_torch_device(self.device)
 
     def mse(self, pred, label, weight):
         loss = weight * (pred - label) ** 2
@@ -276,27 +286,31 @@ class GRU(Model):
         torch.save(best_param, save_path)
 
         if self.use_gpu:
-            torch.cuda.empty_cache()
+            empty_torch_cache(self.device)
 
-    def predict(self, dataset):
+    def predict(self, dataset, segment="test"):
         if not self.fitted:
             raise ValueError("model is not fitted yet!")
 
-        dl_test = dataset.prepare("test", col_set=["feature", "label"], data_key=DataHandlerLP.DK_I)
+        dl_test = dataset.prepare(segment, col_set=["feature", "label"], data_key=DataHandlerLP.DK_I)
         dl_test.config(fillna_type="ffill+bfill")
-        test_loader = DataLoader(dl_test, batch_size=self.batch_size, num_workers=self.n_jobs)
+        index = dl_test.get_index()
         self.GRU_model.eval()
+
+        # Materialize the whole test feature set in one vectorized call (no
+        # per-sample Python loop / DataLoader overhead) and upload it once to
+        # the accelerator; features stay resident across repeated ``predict``.
+        feature = dl_test.to_numpy()[:, :, 0:-1]  # [N, step_len, d_feat]
+        data = to_infer_device(feature, self.device, use_fp16=self.use_fp16, cache=self._infer_cache)
+
         preds = []
+        with torch.no_grad():
+            for begin in range(0, len(data), self.pred_batch_size):
+                x = data[begin : begin + self.pred_batch_size]
+                preds.append(self.GRU_model(x).detach())
+        preds = torch.cat(preds).cpu().numpy()
 
-        for data in test_loader:
-            feature = data[:, :, 0:-1].to(self.device)
-
-            with torch.no_grad():
-                pred = self.GRU_model(feature.float()).detach().cpu().numpy()
-
-            preds.append(pred)
-
-        return pd.Series(np.concatenate(preds), index=dl_test.get_index())
+        return pd.Series(preds.reshape(-1), index=index)
 
 
 class GRUModel(nn.Module):
@@ -315,5 +329,5 @@ class GRUModel(nn.Module):
         self.d_feat = d_feat
 
     def forward(self, x):
-        out, _ = self.rnn(x)
+        out = rnn_forward(self.rnn, x)
         return self.fc_out(out[:, -1, :]).squeeze()
