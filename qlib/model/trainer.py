@@ -48,7 +48,10 @@ def _log_task_info(task_config: dict):
 
 
 def _exe_task(task_config: dict):
+    from qlib.contrib.model.accelerator_config import apply_accelerator_to_model_config
+
     rec = R.get_recorder()
+    apply_accelerator_to_model_config(task_config.get("model"))
     # model & dataset initialization
     model: Model = init_instance_by_config(task_config["model"], accept_types=Model)
     dataset: Dataset = init_instance_by_config(task_config["dataset"], accept_types=Dataset)

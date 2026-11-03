@@ -265,6 +265,11 @@ _default_config = {
     # if min_data_shift == 0, use default market time [9:30, 11:29, 1:00, 2:59]
     # if min_data_shift != 0, use shifted market time [9:30, 11:29, 1:00, 2:59] - shift*minute
     "min_data_shift": 0,
+    # PyTorch / workflow accelerator defaults (override via qlib.init(accelerator={...}))
+    "accelerator": {
+        "device_type": "auto",
+        "device_id": 0,
+    },
 }
 
 MODE_CONF = {
@@ -474,6 +479,11 @@ class QlibConfig(Config):
 
         self.set_mode(default_conf)
         self.set_region(kwargs.get("region", self["region"] if "region" in self else REG_CN))
+
+        if isinstance(kwargs.get("accelerator"), dict):
+            acc = copy.deepcopy(self._default_config.get("accelerator", {}))
+            acc.update(kwargs["accelerator"])
+            kwargs["accelerator"] = acc
 
         for k, v in kwargs.items():
             if k not in self:
