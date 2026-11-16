@@ -8,6 +8,7 @@ from collections import defaultdict
 
 import os
 import gc
+import weakref
 import numpy as np
 import pandas as pd
 from packaging import version
@@ -17,7 +18,6 @@ from sklearn.metrics import roc_auc_score, mean_squared_error
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from .infer_utils import InferTensorCache, to_infer_device
 from .pytorch_utils import count_parameters
 from .torch_device import empty_torch_cache, resolve_torch_device, use_torch_device
 from ...model.base import Model
@@ -77,7 +77,6 @@ class DNNModelPytorch(Model):
             "layers": (256,),
         },
         use_fp16=False,
-        pred_batch_size=16000,
         valid_key=DataHandlerLP.DK_L,
         # TODO: Infer Key is a more reasonable key. But it requires more detailed processing on label processing
     ):
@@ -101,10 +100,10 @@ class DNNModelPytorch(Model):
         self.eval_train_metric = eval_train_metric
         self.valid_key = valid_key
         self.use_fp16 = use_fp16
-        self.pred_batch_size = pred_batch_size
 
         # cache for the last uploaded inference features (data "常驻 NPU")
-        self._infer_cache = InferTensorCache()
+        self._infer_cache_src = None  # weakref to the source feature object
+        self._infer_cache_tensor = None  # device tensor of the uploaded features
 
         self.best_step = None
 
@@ -226,16 +225,6 @@ class DNNModelPytorch(Model):
                     all_t[v][seg] = torch.from_numpy(all_df[v][seg].values).float()
                     # if seg == "valid": # accelerate the eval of validation
                     all_t[v][seg] = all_t[v][seg].to(self.device)  # This will consume a lot of memory !!!!
-                    # ``DataFrame.values`` is Fortran-ordered, so the uploaded
-                    # tensor lands on the accelerator in a column-major
-                    # (feature-first, non-contiguous) layout.  Each per-step
-                    # fancy index ``x[choice]`` inside the training loop would
-                    # then force ``aclnnIndex`` to transpose the whole tensor
-                    # to row-major every single step.  Materialize the
-                    # row-major contiguous layout once here instead (a single
-                    # ~850us device transpose), so per-step indexing operates
-                    # directly on a contiguous tensor.
-                    all_t[v][seg] = all_t[v][seg].contiguous()
 
                 evals_result[seg] = []
                 # free memory
@@ -371,18 +360,71 @@ class DNNModelPytorch(Model):
         # NOTE: the order of the index must follow <datetime, instrument> sorted order
         return -ICLoss()(pred, target, index)  # pylint: disable=E1130
 
+    def _to_device(self, data):
+        """Upload feature data to ``self.device`` for inference.
+
+        Performance notes (the inference bottleneck is the data pipeline, not
+        the model):
+
+        - Repeated inference over the *same* feature object (e.g. ``predict``
+          being called multiple times) reuses a cached device tensor, so the
+          features are transferred to the accelerator only once.
+        - ``pandas`` stores each column in its own internal block, so
+          ``DataFrame.values`` returns a Fortran-ordered array whose
+          ``.to(device)`` triggers a slow strided host-to-device copy. We
+          upload the flat contiguous buffer instead and transpose on the
+          accelerator, which is bitwise-identical and several times faster.
+        - With ``use_fp16=True`` the CPU tensor is cast to half precision so
+          the transfer bytes (and device memory) are halved; it is cast back
+          to fp32 on the accelerator before the forward pass.
+        """
+        if isinstance(data, torch.Tensor):
+            return data.to(self.device)
+
+        src = self._infer_cache_src
+        if src is not None and self._infer_cache_tensor is not None and src() is data:
+            return self._infer_cache_tensor
+
+        if isinstance(data, pd.DataFrame):
+            arr = data.values
+        else:
+            arr = np.asarray(data)
+        if arr.dtype != np.float32:
+            arr = arr.astype(np.float32)
+
+        if arr.ndim == 2 and arr.flags["F_CONTIGUOUS"] and not arr.flags["C_CONTIGUOUS"]:
+            # zero-copy contiguous view of a Fortran-ordered array
+            cpu = torch.from_numpy(arr.ravel(order="F"))
+            need_transpose = True
+        else:
+            cpu = torch.from_numpy(np.ascontiguousarray(arr))
+            need_transpose = False
+
+        if self.use_fp16:
+            cpu = cpu.half()
+        cpu = cpu.to(self.device)
+        if need_transpose:
+            cpu = cpu.view(arr.shape[1], arr.shape[0]).t().contiguous()
+        if self.use_fp16:
+            cpu = cpu.float()
+
+        self._infer_cache_src = weakref.ref(data)
+        self._infer_cache_tensor = cpu
+        return cpu
+
     def _nn_predict(self, data, return_cpu=True):
         """Reusing predicting NN.
         Scenarios
         1) test inference (data may come from CPU and expect the output data is on CPU)
         2) evaluation on training (data may come from GPU)
         """
-        data = to_infer_device(data, self.device, use_fp16=self.use_fp16, cache=self._infer_cache)
+        data = self._to_device(data)
         preds = []
         self.dnn_model.eval()
         with torch.no_grad():
-            for i in range(0, len(data), self.pred_batch_size):
-                x = data[i : i + self.pred_batch_size]
+            batch_size = 8096
+            for i in range(0, len(data), batch_size):
+                x = data[i : i + batch_size]
                 preds.append(self.dnn_model(x).detach().reshape(-1))
         if return_cpu:
             preds = np.concatenate([pr.cpu().numpy() for pr in preds])
