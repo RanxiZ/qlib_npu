@@ -132,6 +132,9 @@ def workflow(config_path, experiment_name="workflow", uri_folder="mlruns"):
         logger.info(f"Load BASE_CONFIG_PATH succeed: {path.resolve()}")
         config = update_config(base_config, config)
 
+    from qlib.cli.npu_env import ensure_npu_environment
+    ensure_npu_environment(config)
+
     # config the `sys` section
     sys_config(config, config_path)
 
