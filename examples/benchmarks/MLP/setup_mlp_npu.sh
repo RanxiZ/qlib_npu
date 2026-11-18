@@ -11,13 +11,13 @@ VENV=${MLP_VENV:-$ROOT/.venv-mlp-npu}
 "$VENV/bin/python" -m pip install --no-deps --no-build-isolation -e "$ROOT"
 # Keep the generated CLI entry point, but prepare CANN for every qrun invocation.
 cp "$VENV/bin/qrun" "$VENV/bin/qrun.python"
-"$VENV/bin/python" - "$VENV" "$CANN_ENV" <<'PY'
+"$VENV/bin/python" - "$VENV" "$CANN_ENV" "$ROOT" <<'PY'
 import pathlib,shlex,sys
-v=pathlib.Path(sys.argv[1]); env=sys.argv[2]
-(v/'bin/qrun').write_text('#!/usr/bin/env bash\nset -eo pipefail\nsource '+shlex.quote(env)+'\nexec '+shlex.quote(str(v/'bin/python'))+' '+shlex.quote(str(v/'bin/qrun.python'))+' "$@"\n')
+v=pathlib.Path(sys.argv[1]); env=sys.argv[2]; root=sys.argv[3]
+(v/'bin/qrun').write_text('#!/usr/bin/env bash\nset -eo pipefail\nsource '+shlex.quote(env)+'\nexport PYTHONPATH='+shlex.quote(root)+'${PYTHONPATH:+:"$PYTHONPATH"}\nexec '+shlex.quote(str(v/'bin/python'))+' '+shlex.quote(str(v/'bin/qrun.python'))+' "$@"\n')
 PY
 chmod +x "$VENV/bin/qrun"
-PYTHONDONTWRITEBYTECODE=1 "$VENV/bin/python" - "$ROOT" <<'PY'
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" PYTHONDONTWRITEBYTECODE=1 "$VENV/bin/python" - "$ROOT" <<'PY'
 import pathlib,sys,torch,torch_npu
 import qlib
 from qlib.contrib.model.pytorch_nn import DNNModelPytorch
