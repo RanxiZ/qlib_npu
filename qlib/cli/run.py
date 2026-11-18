@@ -1,5 +1,6 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
+from contextlib import nullcontext
 import logging
 import os
 from pathlib import Path
@@ -132,6 +133,17 @@ def workflow(config_path, experiment_name="workflow", uri_folder="mlruns"):
         logger.info(f"Load BASE_CONFIG_PATH succeed: {path.resolve()}")
         config = update_config(base_config, config)
 
+    alignment = nullcontext()
+    if config.get("mlp_cuda_alignment"):
+        from qlib.contrib.model.mlp_cuda_alignment import compatibility_context
+
+        seed = config["task"]["model"]["kwargs"].get("seed")
+        if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
+            raise ValueError("Set MLP_SEED to an integer from 0 to 4294967295 before running qrun.")
+        if not os.environ.get("PYTHONHASHSEED", "").isdigit():
+            raise ValueError("Set PYTHONHASHSEED before running qrun to reproduce portfolio metrics.")
+        alignment = compatibility_context(seed)
+
     # config the `sys` section
     sys_config(config, config_path)
 
@@ -144,8 +156,9 @@ def workflow(config_path, experiment_name="workflow", uri_folder="mlruns"):
 
     if "experiment_name" in config:
         experiment_name = config["experiment_name"]
-    recorder = task_train(config.get("task"), experiment_name=experiment_name)
-    recorder.save_objects(config=config)
+    with alignment:
+        recorder = task_train(config.get("task"), experiment_name=experiment_name)
+        recorder.save_objects(config=config)
 
 
 # function to run workflow by config
